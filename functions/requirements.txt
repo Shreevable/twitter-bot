@@ -1,0 +1,7 @@
+click==8.1.7
+python-dotenv==1.0.0
+requests==2.31.0
+rich==13.7.0
+yt-dlp==2024.3.10
+ffmpeg-python==0.2.0
+firebase-admin==6.4.0

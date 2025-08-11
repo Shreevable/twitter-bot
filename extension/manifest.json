@@ -1,18 +1,17 @@
-  {
-    "manifest_version": 3,
-    "name": "Tweet Summarizer",
-    "version": "1.0",
-    "description": "Summarize tweets with AI and listen instantly.",
-    "permissions": ["activeTab", "scripting"],
-    "host_permissions": ["https://x.com/*"],
-    "content_scripts": [
-      {
-        "matches": ["https://x.com/*"],
-        "js": ["content.js"]
-      }
-    ],
-    "action": {
-      "default_popup": "popup.html",
-      "default_title": "Tweet Summarizer"
+{
+  "manifest_version": 3,
+  "name": "Tweet Video Dubber",
+  "version": "1.0",
+  "description": "Dub Twitter videos into different languages using Murf AI.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://x.com/*", "http://localhost:5001/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["content.js"]
     }
+  ],
+  "action": {
+    "default_title": "Tweet Video Dubber"
   }
+}
