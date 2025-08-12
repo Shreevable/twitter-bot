@@ -4,13 +4,8 @@
   "version": "1.0",
   "description": "Dub Twitter videos into different languages using Murf AI.",
   "permissions": ["activeTab", "scripting"],
-  "host_permissions": ["https://x.com/*", "http://localhost:5001/*"],
-  "content_scripts": [
-    {
-      "matches": ["https://x.com/*"],
-      "js": ["content.js"]
-    }
-  ],
+  "host_permissions": [],
+  "content_scripts": [],
   "action": {
     "default_title": "Tweet Video Dubber"
   }

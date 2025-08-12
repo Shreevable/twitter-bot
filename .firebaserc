@@ -1,7 +1,7 @@
 {
   "projects": {
-    "default": "project-4261681351",
-    "twibot": "project-4261681351"
+    "default": "my-twitter-bot-33f78",
+    "twibot": "my-twitter-bot-33f78"
   },
   "targets": {},
   "etags": {}

@@ -1,5 +1,6 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { setGlobalOptions } from "firebase-functions/v2/options";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as logger from "firebase-functions/logger";
 import admin from "firebase-admin";
 import { TwitterApi } from "twitter-api-v2";
@@ -19,6 +20,7 @@ dotenv.config();
 setGlobalOptions({ region: "us-central1", timeoutSeconds: 540, memory: "1GiB" });
 
 const dbRef = admin.firestore().doc("tokens/demo");
+const stateRef = admin.firestore().doc("state/bot");
 
 // Language mapping for Murf API
 const LANGUAGE_MAP = {
@@ -63,7 +65,7 @@ const twitterClient = new TwitterApi({
   accessSecret: process.env.ACCESS_TOKEN_SECRET,
 });
 
-// Helper function to extract language from tweet text
+// Helper function to extract language from arbitrary text (mention text or tweet text)
 async function extractLanguageFromTweet(tweetText) {
   const res = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -82,6 +84,46 @@ async function extractLanguageFromTweet(tweetText) {
   const match = content.match(/([A-Za-z]+)/);
   if (!match) throw new Error(`Failed to parse language from OpenAI response: ${content}`);
   return match[1];
+}
+
+// Extract tweet URL and language from a mention text using OpenAI with regex fallbacks
+async function parseMention(text) {
+  const fallback = { language: undefined, tweetUrl: undefined };
+  if (!text || typeof text !== "string") return fallback;
+
+  // First try quick regex for a tweet URL
+  const urlMatch = text.match(/https?:\/\/(?:x|twitter)\.com\/[A-Za-z0-9_]+\/status\/(\d+)/);
+  const guessedUrl = urlMatch ? urlMatch[0] : undefined;
+
+  // Attempt to extract language token heuristically (simple code words like 'en', 'hi', etc.)
+  const isoGuess = text.match(/\b(fr|de|es|hi|ja|en|ko|zh)\b/i);
+
+  // Use OpenAI to robustly parse when ambiguous
+  try {
+    const prompt = `Extract two fields from the text: 1) language desired for dubbing, 2) tweet URL.\n` +
+      `Return JSON strictly as {"language":"<Name or ISO>","tweetUrl":"<URL or empty>"}.\n` +
+      `Text: ${text}`;
+    const res = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You extract {language, tweetUrl} from short messages. Return strict JSON." },
+        { role: "user", content: prompt }
+      ]
+    });
+    const content = res.choices?.[0]?.message?.content?.trim();
+    try {
+      const parsed = JSON.parse(content);
+      return {
+        language: parsed.language || (isoGuess ? isoGuess[0] : undefined),
+        tweetUrl: parsed.tweetUrl || guessedUrl
+      };
+    } catch {
+      return { language: isoGuess ? isoGuess[0] : undefined, tweetUrl: guessedUrl };
+    }
+  } catch (e) {
+    logger.warn("OpenAI parseMention failed, falling back to regex", { error: e.message });
+    return { language: isoGuess ? isoGuess[0] : undefined, tweetUrl: guessedUrl };
+  }
 }
 
 // Helper function to send video to Murf and poll for result
@@ -361,22 +403,194 @@ export const dubVideo = onRequest(async (req, res) => {
     }
 });
 
-// Webhook endpoint for Twitter to notify us about new mentions
+// Webhook-style endpoint to process mentions to our bot account
+// Supports two payload shapes:
+// 1) Twitter Account Activity API style: { tweet_create_events: [ { id_str, text, user, ... } ] }
+// 2) Simplified test payload: { id: "...", text: "@bot please dub ... <tweetUrl>", screen_name: "..." }
 export const handleMention = onRequest(async (req, res) => {
+  const requestId = `mention_${Date.now()}`;
   try {
-    const { tweet_create_events } = req.body;
-    if (!tweet_create_events) return res.status(400).send("No tweet event found");
-
-    const tweet = tweet_create_events[0];
-    if (!tweet.in_reply_to_status_id_str) {
-      return res.status(400).send("Not a reply tweet");
+    // Normalize payload
+    let mention = undefined;
+    if (Array.isArray(req.body?.tweet_create_events) && req.body.tweet_create_events.length > 0) {
+      mention = req.body.tweet_create_events[0];
+    } else if (req.body && req.body.text) {
+      mention = req.body;
     }
 
-    // Trigger dubbing process
-    const originalTweetId = tweet.in_reply_to_status_id_str;
-    await handleDubbing({ query: { tweetId: originalTweetId } }, res);
+    if (!mention) {
+      logger.warn("handleMention: invalid payload", { requestId, bodyKeys: Object.keys(req.body || {}) });
+      return res.status(400).json({ error: "Invalid mention payload" });
+    }
+
+    const mentionText = mention.text || "";
+    const authorScreenName = mention.user?.screen_name || mention.screen_name || "user";
+    logger.info("handleMention: received", { requestId, authorScreenName, text: mentionText });
+
+    // Extract tweet URL and desired language
+    const { language: desiredLanguageRaw, tweetUrl } = await parseMention(mentionText);
+    if (!tweetUrl) {
+      logger.warn("handleMention: missing tweet URL", { requestId, mentionText });
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} I couldn't find a tweet URL in your message. Please include a link to the tweet with the video.`,
+        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+      }).catch((e) => logger.error("reply warn failed", { error: e.message }));
+      return res.status(400).json({ error: "Missing tweet URL in mention" });
+    }
+
+    const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
+
+    // Post a status update: started
+    try {
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Starting dubbing in ${normalizedLanguage}… I will reply with the result shortly.`,
+        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+      });
+    } catch (e) {
+      logger.warn("handleMention: initial status tweet failed", { error: e.message });
+    }
+
+    // Reuse the same flow as dubVideo to process the tweet URL end-to-end
+    logger.info("handleMention: downloading video", { requestId, tweetUrl, normalizedLanguage });
+    const videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
+    try {
+      await ytdlp(String(tweetUrl), { output: videoPath, verbose: true });
+      logger.info("handleMention: video downloaded", { requestId, videoPath });
+    } catch (dlError) {
+      logger.error("handleMention: download failed", { requestId, error: dlError.message });
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} I couldn't download that video. The tweet might be private or unsupported.`,
+        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+      }).catch(() => {});
+      return res.status(500).json({ error: "Failed to download video", details: dlError.message });
+    }
+
+    let dubbedVideoUrl = undefined;
+    try {
+      dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
+      logger.info("handleMention: dubbing completed", { requestId, dubbedVideoUrl });
+    } catch (murfError) {
+      logger.error("handleMention: murf failed", { requestId, error: murfError.message });
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Dubbing failed (${normalizedLanguage}). Please try again later.`,
+        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+      }).catch(() => {});
+      return res.status(500).json({ error: "Murf processing failed", details: murfError.message });
+    } finally {
+      try { fs.unlinkSync(videoPath); } catch {}
+    }
+
+    // Reply with the dubbed video link
+    try {
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
+        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+      });
+    } catch (e) {
+      logger.error("handleMention: final reply failed", { error: e.message });
+    }
+
+    return res.json({ success: true, dubbedVideoUrl, language: normalizedLanguage });
   } catch (error) {
-    logger.error(error);
-    res.status(500).json({ error: error.message });
+    logger.error("handleMention: unexpected error", { error: error.message });
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Scheduled mention poller (avoids Twitter webhooks). Runs every minute by default.
+// Reads the bot account mentions, processes new ones, and replies with results.
+export const pollMentions = onSchedule("every 1 minutes", async (event) => {
+  const requestId = `poll_${Date.now()}`;
+  try {
+    logger.info("pollMentions: starting", { requestId });
+    // Identify bot user id
+    const me = await twitterClient.v2.me();
+    const botId = me.data?.id;
+    if (!botId) {
+      logger.error("pollMentions: failed to get bot id");
+      return;
+    }
+
+    // Fetch last processed id
+    const stateSnap = await stateRef.get().catch(() => undefined);
+    const sinceId = stateSnap?.exists ? stateSnap.data().lastMentionId : undefined;
+
+    const params = { max_results: 10 };
+    if (sinceId) params.since_id = sinceId;
+    const timeline = await twitterClient.v2.userMentionTimeline(botId, params);
+
+    if (!timeline?.data?.data?.length) {
+      logger.info("pollMentions: no new mentions", { requestId });
+      return;
+    }
+
+    // Process from oldest to newest
+    const mentions = [...timeline.data.data].reverse();
+    let newestId = sinceId;
+
+    for (const m of mentions) {
+      newestId = m.id; // track newest
+      const text = m.text || "";
+      const authorId = m.author_id;
+      let author = undefined;
+      try {
+        if (authorId) {
+          const user = await twitterClient.v2.user(authorId);
+          author = user.data?.username || "user";
+        }
+      } catch {}
+
+      logger.info("pollMentions: handling mention", { id: m.id, text });
+      const { language: desiredLanguageRaw, tweetUrl } = await parseMention(text);
+      if (!tweetUrl) {
+        await twitterClient.v2.tweet({
+          text: `@${author || "user"} Please include a tweet link with a video to dub.`,
+          reply: { in_reply_to_tweet_id: m.id }
+        }).catch(() => {});
+        continue;
+      }
+      const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
+      try {
+        await twitterClient.v2.tweet({
+          text: `@${author || "user"} Dubbing in ${normalizedLanguage}…`,
+          reply: { in_reply_to_tweet_id: m.id }
+        }).catch(() => {});
+      } catch {}
+
+      const videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
+      try {
+        await ytdlp(String(tweetUrl), { output: videoPath, verbose: true });
+      } catch (dlError) {
+        logger.error("pollMentions: download failed", { error: dlError.message });
+        await twitterClient.v2.tweet({
+          text: `@${author || "user"} I couldn't download that video.`,
+          reply: { in_reply_to_tweet_id: m.id }
+        }).catch(() => {});
+        continue;
+      }
+
+      try {
+        const dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
+        await twitterClient.v2.tweet({
+          text: `@${author || "user"} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
+          reply: { in_reply_to_tweet_id: m.id }
+        }).catch(() => {});
+      } catch (murfError) {
+        logger.error("pollMentions: murf failed", { error: murfError.message });
+        await twitterClient.v2.tweet({
+          text: `@${author || "user"} Dubbing failed (${normalizedLanguage}). Please try again later.`,
+          reply: { in_reply_to_tweet_id: m.id }
+        }).catch(() => {});
+      } finally {
+        try { fs.unlinkSync(videoPath); } catch {}
+      }
+    }
+
+    if (newestId && newestId !== sinceId) {
+      await stateRef.set({ lastMentionId: newestId }, { merge: true });
+    }
+    logger.info("pollMentions: done", { requestId, updatedSince: sinceId, newestId });
+  } catch (e) {
+    logger.error("pollMentions: unexpected error", { error: e.message });
   }
 });
