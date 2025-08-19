@@ -2,9 +2,11 @@ module.exports = {
   env: {
     es6: true,
     node: true,
+    jest: true,
   },
   parserOptions: {
-    "ecmaVersion": 2018,
+    ecmaVersion: 2022,
+    sourceType: "module",
   },
   extends: [
     "eslint:recommended",

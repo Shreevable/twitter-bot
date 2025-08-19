@@ -1,28 +1,51 @@
-import { onRequest } from "firebase-functions/v2/https";
-import { setGlobalOptions } from "firebase-functions/v2/options";
-import { onSchedule } from "firebase-functions/v2/scheduler";
+import {onRequest} from "firebase-functions/v2/https";
+import {setGlobalOptions} from "firebase-functions/v2/options";
+import {onSchedule} from "firebase-functions/v2/scheduler";
+import functionsV1 from "firebase-functions";
 import * as logger from "firebase-functions/logger";
 import admin from "firebase-admin";
-import { TwitterApi } from "twitter-api-v2";
+import {TwitterApi} from "twitter-api-v2";
 import OpenAI from "openai";
 import axios from "axios";
 import FormData from "form-data";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import ytdlp from "yt-dlp-exec";
+import getTwitterMedia from "get-twitter-media";
 import dotenv from "dotenv";
+import crypto from "crypto";
+
+dotenv.config();
 
 admin.initializeApp();
-// Load local env vars when running emulator
-dotenv.config();
-// Set global runtime options (replaces functions.runWith for v2 API)
-setGlobalOptions({ region: "us-central1", timeoutSeconds: 540, memory: "1GiB" });
 
-const dbRef = admin.firestore().doc("tokens/demo");
-const stateRef = admin.firestore().doc("state/bot");
+setGlobalOptions({region: "us-central1", timeoutSeconds: 540, memory: "1GiB"});
 
-// Language mapping for Murf API
+const db = admin.firestore();
+const stateRef = db.doc("state/bot");
+const processedTweetsRef = db.collection("processedTweets");
+
+const runtimeConfig = (() => {
+  try {
+    return functionsV1.config();
+  } catch {
+    return {};
+  }
+})();
+
+function getConfig(key, ns, nsKey) {
+  return process.env[key] || (runtimeConfig?.[ns]?.[nsKey]);
+}
+
+const twitterKeys = {
+  appKey: getConfig("API_KEY", "twitter", "api_key"),
+  appSecret: getConfig("API_KEY_SECRET", "twitter", "api_key_secret"),
+  accessToken: getConfig("ACCESS_TOKEN", "twitter", "access_token"),
+  accessSecret: getConfig("ACCESS_TOKEN_SECRET", "twitter", "access_token_secret"),
+};
+const openaiKey = getConfig("OPENAI_API_KEY", "openai", "key");
+const murfKey = getConfig("MURF_API_KEY", "murf", "key");
+
 const LANGUAGE_MAP = {
   French: "fr_FR",
   German: "de_DE",
@@ -34,7 +57,6 @@ const LANGUAGE_MAP = {
   Chinese: "zh_CN",
 };
 
-// Normalize language input from UI (e.g., "hi", "fr") or names
 function normalizeLanguage(input) {
   if (!input) return undefined;
   const trimmed = String(input).trim();
@@ -50,55 +72,28 @@ function normalizeLanguage(input) {
     zh: "Chinese",
   };
   if (isoToName[lower]) return isoToName[lower];
-  // Capitalize first letter for names like "french" → "French"
   return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
 }
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+let openai;
+let twitterClient;
 
-const twitterClient = new TwitterApi({
-  appKey: process.env.API_KEY,
-  appSecret: process.env.API_KEY_SECRET,
-  accessToken: process.env.ACCESS_TOKEN,
-  accessSecret: process.env.ACCESS_TOKEN_SECRET,
-});
-
-// Helper function to extract language from arbitrary text (mention text or tweet text)
-async function extractLanguageFromTweet(tweetText) {
-  const res = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-        content: "You are a helpful bot that extracts the desired language for dubbing from a tweet. Respond with only the language in this format: French",
-        },
-        {
-          role: "user",
-        content: `Find out the desired output language from: ${tweetText}`,
-        },
-      ],
-    });
-  const content = res.choices[0].message.content.trim();
-  const match = content.match(/([A-Za-z]+)/);
-  if (!match) throw new Error(`Failed to parse language from OpenAI response: ${content}`);
-  return match[1];
+try {
+  openai = new OpenAI({apiKey: openaiKey});
+  twitterClient = new TwitterApi(twitterKeys);
+} catch (e) {
+  logger.error("Failed to initialize API clients", {error: e.message});
 }
 
-// Extract tweet URL and language from a mention text using OpenAI with regex fallbacks
 async function parseMention(text) {
-  const fallback = { language: undefined, tweetUrl: undefined };
+  const fallback = {language: undefined, tweetUrl: undefined};
   if (!text || typeof text !== "string") return fallback;
 
-  // First try quick regex for a tweet URL
   const urlMatch = text.match(/https?:\/\/(?:x|twitter)\.com\/[A-Za-z0-9_]+\/status\/(\d+)/);
   const guessedUrl = urlMatch ? urlMatch[0] : undefined;
 
-  // Attempt to extract language token heuristically (simple code words like 'en', 'hi', etc.)
   const isoGuess = text.match(/\b(fr|de|es|hi|ja|en|ko|zh)\b/i);
 
-  // Use OpenAI to robustly parse when ambiguous
   try {
     const prompt = `Extract two fields from the text: 1) language desired for dubbing, 2) tweet URL.\n` +
       `Return JSON strictly as {"language":"<Name or ISO>","tweetUrl":"<URL or empty>"}.\n` +
@@ -106,27 +101,26 @@ async function parseMention(text) {
     const res = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You extract {language, tweetUrl} from short messages. Return strict JSON." },
-        { role: "user", content: prompt }
-      ]
+        {role: "system", content: "You extract {language, tweetUrl} from short messages. Return strict JSON."},
+        {role: "user", content: prompt},
+      ],
     });
     const content = res.choices?.[0]?.message?.content?.trim();
     try {
       const parsed = JSON.parse(content);
       return {
         language: parsed.language || (isoGuess ? isoGuess[0] : undefined),
-        tweetUrl: parsed.tweetUrl || guessedUrl
+        tweetUrl: parsed.tweetUrl || guessedUrl,
       };
     } catch {
-      return { language: isoGuess ? isoGuess[0] : undefined, tweetUrl: guessedUrl };
+      return {language: isoGuess ? isoGuess[0] : undefined, tweetUrl: guessedUrl};
     }
   } catch (e) {
-    logger.warn("OpenAI parseMention failed, falling back to regex", { error: e.message });
-    return { language: isoGuess ? isoGuess[0] : undefined, tweetUrl: guessedUrl };
+    logger.warn("OpenAI parseMention failed, falling back to regex", {error: e.message});
+    return {language: isoGuess ? isoGuess[0] : undefined, tweetUrl: guessedUrl};
   }
 }
 
-// Helper function to send video to Murf and poll for result
 async function sendToMurf(videoPath, language) {
   logger.info(`Starting Murf process for language: ${language}, video: ${videoPath}`);
   const targetLocale = LANGUAGE_MAP[language];
@@ -135,7 +129,7 @@ async function sendToMurf(videoPath, language) {
     throw new Error(`Unsupported language: ${language}`);
   }
 
-  logger.info(`Creating form data with video file...`);
+  logger.info("Creating form data with video file...");
   const fileStream = fs.createReadStream(videoPath);
   const form = new FormData();
   form.append("file", fileStream, "input.mp4");
@@ -144,32 +138,31 @@ async function sendToMurf(videoPath, language) {
   form.append("target_locales", targetLocale);
 
   const createResponse = await axios.post(
-    "https://api.murf.ai/v1/murfdub/jobs/create",
-    form,
-    {
+      "https://api.murf.ai/v1/murfdub/jobs/create",
+      form,
+      {
       headers: {
-        "api-key": process.env.MURF_API_KEY,
-        ...form.getHeaders(),
+          "api-key": murfKey,
+          ...form.getHeaders(),
+        },
       },
-    }
   );
 
   const jobId = createResponse.data.job_id;
   logger.info("Created Murf Job ID:", jobId);
 
-  // Polling Murf job status every 3 seconds for up to 6 minutes
   const maxRetries = 120;
   const pollingInterval = 3000;
 
   for (let i = 0; i < maxRetries; i++) {
     try {
       const statusResponse = await axios.get(
-        `https://api.murf.ai/v1/murfdub/jobs/${jobId}/status`,
-        {
-          headers: {
-            "api-key": process.env.MURF_API_KEY,
+          `https://api.murf.ai/v1/murfdub/jobs/${jobId}/status`,
+          {
+            headers: {
+              "api-key": murfKey,
+            },
           },
-        }
       );
 
       const jobData = statusResponse.data;
@@ -196,221 +189,9 @@ async function sendToMurf(videoPath, language) {
   throw new Error("Timeout: Murf job did not complete within expected time");
 }
 
-// Helper function to reply with dubbed video
-async function replyWithDubbedVideo(originalTweetId, dubbedVideoUrl, language) {
-  const tempFile = path.join(os.tmpdir(), "dubbed.mp4");
-  const { data } = await axios.get(dubbedVideoUrl, { responseType: "arraybuffer" });
-  fs.writeFileSync(tempFile, data);
-
-  const mediaId = await twitterClient.v1.uploadMedia(tempFile, {
-    mimeType: "video/mp4",
-  });
-
-  await twitterClient.v2.reply(
-    `Here is the dubbed video in ${language}:`,
-    originalTweetId,
-    { media: { media_ids: [mediaId] } }
-  );
-
-  // Cleanup
-  fs.unlinkSync(tempFile);
-  functions.logger.info(`Replied to tweet ${originalTweetId} with video`);
-}
-
-// Main function to handle video dubbing
-export const handleDubbing = onRequest(async (req, res) => {
-  try {
-    const { tweetId, targetLanguage } = req.query;
-    if (!tweetId) {
-      logger.warn("Missing tweetId parameter");
-      return res.status(400).send("Missing tweetId");
-    }
-
-    // Get tweet details
-    const tweet = await twitterClient.v2.get(`tweets/${tweetId}`, {
-      expansions: ["attachments.media_keys"],
-      "media.fields": ["url", "variants"],
-      "tweet.fields": ["text"],
-    });
-
-    if (!tweet.data?.attachments?.media_keys) {
-      throw new Error("No media found in tweet");
-    }
-
-    // Determine language: prefer user selection, else extract
-    let language = normalizeLanguage(targetLanguage);
-    if (!language) {
-      language = await extractLanguageFromTweet(tweet.data.text);
-    }
-    logger.info(`Detected language: ${language}`);
-
-    // Get video URL
-    const videoUrl = tweet.includes.media[0].variants
-      .filter((v) => v.content_type === "video/mp4")
-      .sort((a, b) => b.bit_rate - a.bit_rate)[0].url;
-
-    // Download video
-    const videoPath = path.join(os.tmpdir(), `video_${tweetId}.mp4`);
-    await ytdlp(videoUrl, { output: videoPath });
-
-    // Send to Murf for dubbing
-    const dubbedVideoUrl = await sendToMurf(videoPath, language);
-    logger.info(`Dubbed video URL: ${dubbedVideoUrl}`);
-
-    // Reply with dubbed video
-    await replyWithDubbedVideo(tweetId, dubbedVideoUrl, language);
-
-    // Cleanup
-    fs.unlinkSync(videoPath);
-
-    res.json({ success: true, language, dubbedVideoUrl });
-  } catch (error) {
-    logger.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Lightweight CORS wrapper for cross-origin requests from the extension
-function applyCors(req, res) {
-  // Allow requests from x.com and localhost
-  const allowedOrigins = ['https://x.com', 'http://localhost:3000'];
-  const origin = req.headers.origin;
-  
-  if (allowedOrigins.includes(origin)) {
-    res.set('Access-Control-Allow-Origin', origin);
-  } else {
-    // For development, allow all origins
-    res.set('Access-Control-Allow-Origin', '*');
-  }
-  
-  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.set('Access-Control-Max-Age', '3600');
-  
-  if (req.method === 'OPTIONS') {
-    res.status(204).send('');
-    return true;
-  }
-  return false;
-}
-
-// Alias for the extension: same behavior as handleDubbing but with CORS enabled
-// Error types for better client handling
-const ErrorTypes = {
-  DOWNLOAD: "DOWNLOAD_ERROR",
-  MURF: "MURF_ERROR",
-  LANGUAGE: "LANGUAGE_ERROR",
-  TIMEOUT: "TIMEOUT_ERROR",
-  NETWORK: "NETWORK_ERROR"
-};
-
-// Structured error response
-function errorResponse(type, message, details = {}) {
-  const error = { type, message, ...details };
-  logger.error("Structured error:", error);
-  return res.status(500).json({ error });
-}
-
-export const dubVideo = onRequest(async (req, res) => {
-  // CORS for extension
-  if (applyCors(req, res)) return;
-
-  try {
-    logger.info(`dubVideo called with params:`, req.query);
-    const { tweetUrl, targetLanguage } = req.query;
-    
-    if (!tweetUrl) {
-      logger.warn(`Missing tweetUrl parameter`);
-      return res.status(400).json({
-        error: {
-          type: "VALIDATION_ERROR",
-          message: "Missing tweetUrl parameter"
-        }
-      });
-    }
-
-    // Normalize or fallback to English
-    const language = normalizeLanguage(targetLanguage) || "English";
-    logger.info(`dubVideo: Using language ${language}`);
-
-    // Download the tweet video directly without Twitter API (avoids rate limits)
-    logger.info(`Downloading video from tweet URL: ${tweetUrl}`);
-    const videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
-    
-    try {
-      await ytdlp(String(tweetUrl), {
-        output: videoPath,
-        verbose: true
-      });
-      logger.info(`Video downloaded successfully to: ${videoPath}`);
-    } catch (dlError) {
-      logger.error(`Video download failed:`, dlError);
-      return errorResponse(ErrorTypes.DOWNLOAD, "Failed to download video", {
-        details: dlError.message,
-        url: tweetUrl
-      });
-    }
-
-    try {
-      // Send to Murf
-      const dubbedVideoUrl = await sendToMurf(videoPath, language);
-      
-      // Cleanup
-      try { 
-        fs.unlinkSync(videoPath);
-        logger.info(`Cleaned up temporary video file: ${videoPath}`);
-      } catch (cleanupError) {
-        logger.warn(`Failed to cleanup temp file: ${cleanupError.message}`);
-      }
-
-      logger.info(`dubVideo completed successfully. Dubbed URL: ${dubbedVideoUrl}`);
-      return res.json({ 
-        success: true, 
-        language, 
-        dubbedVideoUrl,
-        jobId: dubbedVideoUrl.split('/').pop() // Extract job ID for progress tracking
-      });
-
-    } catch (murfError) {
-      logger.error(`Murf processing failed:`, murfError);
-      return errorResponse(ErrorTypes.MURF, "Failed to process video with Murf", {
-        details: murfError.message,
-        language
-      });
-    }
-  } catch (error) {
-    logger.error(`dubVideo failed with error:`, {
-      message: error.message,
-      stack: error.stack,
-      query: req.query
-    });
-
-    // Determine error type
-    let type = ErrorTypes.NETWORK;
-    let message = "An unexpected error occurred";
-
-    if (error.code === "ECONNABORTED" || error.message.includes("timeout")) {
-      type = ErrorTypes.TIMEOUT;
-      message = "Request timed out. The video might be too long.";
-    } else if (error.message.includes("language")) {
-      type = ErrorTypes.LANGUAGE;
-      message = "Unsupported language selected.";
-    }
-
-    return errorResponse(type, message, {
-      originalError: error.message
-    });
-    }
-});
-
-// Webhook-style endpoint to process mentions to our bot account
-// Supports two payload shapes:
-// 1) Twitter Account Activity API style: { tweet_create_events: [ { id_str, text, user, ... } ] }
-// 2) Simplified test payload: { id: "...", text: "@bot please dub ... <tweetUrl>", screen_name: "..." }
 export const handleMention = onRequest(async (req, res) => {
   const requestId = `mention_${Date.now()}`;
   try {
-    // Normalize payload
     let mention = undefined;
     if (Array.isArray(req.body?.tweet_create_events) && req.body.tweet_create_events.length > 0) {
       mention = req.body.tweet_create_events[0];
@@ -419,178 +200,601 @@ export const handleMention = onRequest(async (req, res) => {
     }
 
     if (!mention) {
-      logger.warn("handleMention: invalid payload", { requestId, bodyKeys: Object.keys(req.body || {}) });
-      return res.status(400).json({ error: "Invalid mention payload" });
+      logger.warn("handleMention: invalid payload", {requestId, bodyKeys: Object.keys(req.body || {})});
+      return res.status(400).json({error: "Invalid mention payload"});
     }
 
     const mentionText = mention.text || "";
     const authorScreenName = mention.user?.screen_name || mention.screen_name || "user";
-    logger.info("handleMention: received", { requestId, authorScreenName, text: mentionText });
+    logger.info("handleMention: received", {requestId, authorScreenName, text: mentionText});
 
-    // Extract tweet URL and desired language
-    const { language: desiredLanguageRaw, tweetUrl } = await parseMention(mentionText);
+    const {language: desiredLanguageRaw, tweetUrl} = await parseMention(mentionText);
     if (!tweetUrl) {
-      logger.warn("handleMention: missing tweet URL", { requestId, mentionText });
+      logger.warn("handleMention: missing tweet URL", {requestId, mentionText});
       await twitterClient.v2.tweet({
         text: `@${authorScreenName} I couldn't find a tweet URL in your message. Please include a link to the tweet with the video.`,
-        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
-      }).catch((e) => logger.error("reply warn failed", { error: e.message }));
-      return res.status(400).json({ error: "Missing tweet URL in mention" });
+        reply: mention.id_str || mention.id ? {in_reply_to_tweet_id: mention.id_str || mention.id} : undefined,
+      }).catch((e) => logger.error("reply warn failed", {error: e.message}));
+      return res.status(400).json({error: "Missing tweet URL in mention"});
     }
 
     const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
 
-    // Post a status update: started
     try {
       await twitterClient.v2.tweet({
         text: `@${authorScreenName} Starting dubbing in ${normalizedLanguage}… I will reply with the result shortly.`,
-        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+        reply: mention.id_str || mention.id ? {in_reply_to_tweet_id: mention.id_str || mention.id} : undefined,
       });
     } catch (e) {
-      logger.warn("handleMention: initial status tweet failed", { error: e.message });
+      logger.warn("handleMention: initial status tweet failed", {error: e.message});
     }
 
-    // Reuse the same flow as dubVideo to process the tweet URL end-to-end
-    logger.info("handleMention: downloading video", { requestId, tweetUrl, normalizedLanguage });
+    logger.info("handleMention: downloading video", {requestId, tweetUrl, normalizedLanguage});
     const videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
     try {
-      await ytdlp(String(tweetUrl), { output: videoPath, verbose: true });
-      logger.info("handleMention: video downloaded", { requestId, videoPath });
+      const videoData = await getTwitterMedia(tweetUrl, {
+        buffer: true,
+      });
+      fs.writeFileSync(videoPath, videoData.media[0].buffer);
+      logger.info("handleMention: video downloaded", {requestId, videoPath});
     } catch (dlError) {
-      logger.error("handleMention: download failed", { requestId, error: dlError.message });
+      logger.error("handleMention: download failed", {requestId, error: dlError.message});
       await twitterClient.v2.tweet({
         text: `@${authorScreenName} I couldn't download that video. The tweet might be private or unsupported.`,
-        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+        reply: mention.id_str || mention.id ? {in_reply_to_tweet_id: mention.id_str || mention.id} : undefined,
       }).catch(() => {});
-      return res.status(500).json({ error: "Failed to download video", details: dlError.message });
+      return res.status(500).json({error: "Failed to download video", details: dlError.message});
     }
 
     let dubbedVideoUrl = undefined;
     try {
       dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
-      logger.info("handleMention: dubbing completed", { requestId, dubbedVideoUrl });
+      logger.info("handleMention: dubbing completed", {requestId, dubbedVideoUrl});
     } catch (murfError) {
-      logger.error("handleMention: murf failed", { requestId, error: murfError.message });
+      logger.error("handleMention: murf failed", {requestId, error: murfError.message});
       await twitterClient.v2.tweet({
         text: `@${authorScreenName} Dubbing failed (${normalizedLanguage}). Please try again later.`,
-        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+        reply: mention.id_str || mention.id ? {in_reply_to_tweet_id: mention.id_str || mention.id} : undefined,
       }).catch(() => {});
-      return res.status(500).json({ error: "Murf processing failed", details: murfError.message });
+      return res.status(500).json({error: "Murf processing failed", details: murfError.message});
     } finally {
-      try { fs.unlinkSync(videoPath); } catch {}
+      try {
+        fs.unlinkSync(videoPath);
+      } catch (e) {
+        logger.warn(`Could not unlink video path ${videoPath}`, e);
+      }
     }
 
-    // Reply with the dubbed video link
     try {
       await twitterClient.v2.tweet({
         text: `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
-        reply: mention.id_str || mention.id ? { in_reply_to_tweet_id: mention.id_str || mention.id } : undefined,
+        reply: mention.id_str || mention.id ? {in_reply_to_tweet_id: mention.id_str || mention.id} : undefined,
       });
     } catch (e) {
-      logger.error("handleMention: final reply failed", { error: e.message });
+      logger.error("handleMention: final reply failed", {error: e.message});
     }
 
-    return res.json({ success: true, dubbedVideoUrl, language: normalizedLanguage });
+    return res.json({success: true, dubbedVideoUrl, language: normalizedLanguage});
   } catch (error) {
-    logger.error("handleMention: unexpected error", { error: error.message });
-    return res.status(500).json({ error: error.message });
+    logger.error("handleMention: unexpected error", {error: error.message});
+    return res.status(500).json({error: error.message});
   }
 });
 
-// Scheduled mention poller (avoids Twitter webhooks). Runs every minute by default.
-// Reads the bot account mentions, processes new ones, and replies with results.
-export const pollMentions = onSchedule("every 1 minutes", async (event) => {
+// Smart polling with rate limiting protection
+export const pollMentions = onSchedule("every 10 minutes", async (event) => {
+  await doPollMentions();
+});
+
+async function doPollMentions() {
   const requestId = `poll_${Date.now()}`;
   try {
-    logger.info("pollMentions: starting", { requestId });
-    // Identify bot user id
-    const me = await twitterClient.v2.me();
-    const botId = me.data?.id;
+    logger.info("pollMentions: starting", {requestId});
+    
+    // Add rate limiting protection
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+    
+    // Use hardcoded bot ID to avoid rate limiting on me() calls
+    // You can get this from your Twitter Developer Portal or by running me() once
+    const botId = "1853976698639147008"; // Replace with your actual bot ID if different
+    
     if (!botId) {
-      logger.error("pollMentions: failed to get bot id");
+      logger.error("pollMentions: bot ID not configured");
       return;
     }
-
-    // Fetch last processed id
     const stateSnap = await stateRef.get().catch(() => undefined);
     const sinceId = stateSnap?.exists ? stateSnap.data().lastMentionId : undefined;
-
-    const params = { max_results: 10 };
-    if (sinceId) params.since_id = sinceId;
-    const timeline = await twitterClient.v2.userMentionTimeline(botId, params);
-
+    const params = {
+      max_results: 10,
+      "expansions": "author_id",
+      "user.fields": "username",
+    };
+          if (sinceId) {
+        params.since_id = sinceId;
+      }
+      
+      // Add delay before timeline call
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      let timeline;
+      try {
+        timeline = await twitterClient.v2.userMentionTimeline(botId, params);
+      } catch (timelineError) {
+        if (timelineError.code === 429) {
+          logger.warn("Rate limited on timeline call, skipping this run", {requestId});
+          return;
+        }
+        throw timelineError;
+      }
     if (!timeline?.data?.data?.length) {
-      logger.info("pollMentions: no new mentions", { requestId });
+      logger.info("pollMentions: no new mentions", {requestId});
       return;
     }
 
-    // Process from oldest to newest
+    const authors = timeline.includes?.users || [];
+    const authorMap = new Map(authors.map((a) => [a.id, a.username]));
+
     const mentions = [...timeline.data.data].reverse();
     let newestId = sinceId;
-
     for (const m of mentions) {
-      newestId = m.id; // track newest
+      newestId = m.id;
       const text = m.text || "";
       const authorId = m.author_id;
-      let author = undefined;
-      try {
-        if (authorId) {
-          const user = await twitterClient.v2.user(authorId);
-          author = user.data?.username || "user";
-        }
-      } catch {}
+      const author = authorMap.get(authorId) || "user";
 
-      logger.info("pollMentions: handling mention", { id: m.id, text });
-      const { language: desiredLanguageRaw, tweetUrl } = await parseMention(text);
+      // Check if tweet has been processed
+      const tweetDoc = await processedTweetsRef.doc(m.id).get();
+      if (tweetDoc.exists) {
+        logger.info("Skipping already processed tweet", {id: m.id});
+        continue;
+      }
+
+      logger.info("pollMentions: handling mention", {id: m.id, text, author});
+      const {language: desiredLanguageRaw, tweetUrl} = await parseMention(text);
       if (!tweetUrl) {
-        await twitterClient.v2.tweet({
-          text: `@${author || "user"} Please include a tweet link with a video to dub.`,
-          reply: { in_reply_to_tweet_id: m.id }
-        }).catch(() => {});
+        const replyText = `@${author || "user"} Please include a tweet link with a video to dub.`;
+        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
         continue;
       }
       const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
       try {
-        await twitterClient.v2.tweet({
-          text: `@${author || "user"} Dubbing in ${normalizedLanguage}…`,
-          reply: { in_reply_to_tweet_id: m.id }
-        }).catch(() => {});
-      } catch {}
-
+        const replyText = `@${author || "user"} Dubbing in ${normalizedLanguage}…`;
+        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
+      } catch (e) {
+        logger.warn(`Could not post initial reply for ${m.id}`, e);
+      }
       const videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
       try {
-        await ytdlp(String(tweetUrl), { output: videoPath, verbose: true });
+        const videoData = await getTwitterMedia(tweetUrl, {
+          buffer: true,
+        });
+        fs.writeFileSync(videoPath, videoData.media[0].buffer);
       } catch (dlError) {
-        logger.error("pollMentions: download failed", { error: dlError.message });
-        await twitterClient.v2.tweet({
-          text: `@${author || "user"} I couldn't download that video.`,
-          reply: { in_reply_to_tweet_id: m.id }
-        }).catch(() => {});
+        logger.error("pollMentions: download failed", {error: dlError.message});
+        const replyText = `@${author || "user"} I couldn't download that video.`;
+        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
         continue;
       }
-
       try {
         const dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
-        await twitterClient.v2.tweet({
-          text: `@${author || "user"} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
-          reply: { in_reply_to_tweet_id: m.id }
-        }).catch(() => {});
+        const replyText = `@${author || "user"} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`;
+        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
+        await processedTweetsRef.doc(m.id).set({status: "processed", timestamp: new Date()});
       } catch (murfError) {
-        logger.error("pollMentions: murf failed", { error: murfError.message });
-        await twitterClient.v2.tweet({
-          text: `@${author || "user"} Dubbing failed (${normalizedLanguage}). Please try again later.`,
-          reply: { in_reply_to_tweet_id: m.id }
-        }).catch(() => {});
+        logger.error("pollMentions: murf failed", {error: murfError.message});
+        const replyText = `@${author || "user"} Dubbing failed (${normalizedLanguage}). Please try again later.`;
+        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
       } finally {
-        try { fs.unlinkSync(videoPath); } catch {}
+        try {
+          fs.unlinkSync(videoPath);
+        } catch (e) {
+          logger.warn(`Could not unlink video path ${videoPath}`, e);
+        }
+      }
+    }
+    if (newestId && newestId !== sinceId) {
+      await stateRef.set({lastMentionId: newestId}, {merge: true});
+    }
+    logger.info("pollMentions: done", {requestId, updatedSince: sinceId, newestId});
+  } catch (e) {
+    logger.error("pollMentions: unexpected error", {
+      error: e.message,
+      stack: e.stack,
+      requestId,
+    });
+  }
+}
+
+export const pollMentionsHttp = onRequest(async (req, res) => {
+  try {
+    await doPollMentions();
+    return res.json({success: true});
+  } catch (e) {
+    return res.status(500).json({error: e.message});
+  }
+});
+
+// Direct tweet processing endpoint - no polling needed!
+export const processTweetDirect = onRequest(async (req, res) => {
+  const requestId = `direct_${Date.now()}`;
+  
+  try {
+    const tweetId = req.query.tweetId || req.body.tweetId;
+    
+    if (!tweetId) {
+      return res.status(400).json({error: "Missing tweetId parameter. Use ?tweetId=YOUR_TWEET_ID"});
+    }
+    
+    logger.info("processTweetDirect: starting", {requestId, tweetId});
+    
+    // Get the tweet directly using Twitter API
+    const tweet = await twitterClient.v2.singleTweet(tweetId, {
+      expansions: ['author_id'],
+      'user.fields': ['username']
+    });
+    
+    if (!tweet.data) {
+      return res.status(404).json({error: "Tweet not found or not accessible"});
+    }
+    
+    const tweetText = tweet.data.text;
+    const author = tweet.includes?.users?.[0];
+    const authorScreenName = author?.username || "unknown";
+    
+    logger.info("processTweetDirect: found tweet", {requestId, tweetId, text: tweetText, author: authorScreenName});
+    
+    // Check if it mentions our bot
+    if (!tweetText.includes('@SinghVikra26892')) {
+      return res.status(400).json({error: "Tweet doesn't mention @SinghVikra26892"});
+    }
+    
+    // Parse the mention for language and video URL
+    const {language: desiredLanguageRaw, tweetUrl} = await parseMention(tweetText);
+    
+    const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
+    
+    logger.info("processTweetDirect: processing", {requestId, tweetId, language: normalizedLanguage, parsedUrl: tweetUrl});
+    
+    // Reply to let them know we're starting
+    try {
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Starting dubbing in ${normalizedLanguage}… I will reply with the result shortly.`,
+        reply: {in_reply_to_tweet_id: tweetId}
+      });
+    } catch (e) {
+      logger.warn("processTweetDirect: initial reply failed", {error: e.message});
+    }
+    
+    // Download video - try multiple approaches
+    let videoPath;
+    try {
+      let videoUrl = null;
+      
+      // First, check if this tweet itself has media attachments
+      const tweetWithMedia = await twitterClient.v2.singleTweet(tweetId, {
+        expansions: ['attachments.media_keys'],
+        'media.fields': ['url', 'variants', 'type']
+      });
+      
+      if (tweetWithMedia.includes?.media?.length > 0) {
+        const videoMedia = tweetWithMedia.includes.media.find(m => m.type === 'video');
+        if (videoMedia && videoMedia.variants) {
+          // Get the highest quality MP4 variant
+          const mp4Variant = videoMedia.variants
+            .filter(v => v.content_type === 'video/mp4')
+            .sort((a, b) => (b.bit_rate || 0) - (a.bit_rate || 0))[0];
+          if (mp4Variant) {
+            videoUrl = mp4Variant.url;
+            logger.info("processTweetDirect: found video in tweet media", {requestId, videoUrl});
+          }
+        }
+      }
+      
+      // If no video found in tweet media, try the parsed URL
+      if (!videoUrl && tweetUrl) {
+        try {
+          videoUrl = await getTwitterMedia(tweetUrl, {type: "video"});
+          logger.info("processTweetDirect: got video from parsed URL", {requestId, videoUrl});
+        } catch (e) {
+          logger.warn("processTweetDirect: failed to get video from parsed URL", {requestId, error: e.message});
+        }
+      }
+      
+      if (!videoUrl) {
+        throw new Error("No video found in tweet or referenced URL");
+      }
+      
+      const response = await axios.get(videoUrl, {responseType: "arraybuffer"});
+      const videoBuffer = Buffer.from(response.data);
+      
+      videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
+      fs.writeFileSync(videoPath, videoBuffer);
+      
+      logger.info("processTweetDirect: video downloaded", {requestId, videoPath, size: videoBuffer.length});
+    } catch (dlError) {
+      logger.error("processTweetDirect: download failed", {requestId, error: dlError.message});
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} I couldn't find or download a video from your tweet. Please make sure your tweet contains or links to a video.`,
+        reply: {in_reply_to_tweet_id: tweetId}
+      }).catch(() => {});
+      return res.status(500).json({error: "Failed to download video", details: dlError.message});
+    }
+    
+    // Send to Murf for dubbing
+    let dubbedVideoUrl;
+    try {
+      dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
+      logger.info("processTweetDirect: dubbing completed", {requestId, dubbedVideoUrl});
+    } catch (murfError) {
+      logger.error("processTweetDirect: murf failed", {requestId, error: murfError.message});
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Dubbing failed (${normalizedLanguage}). Please try again later.`,
+        reply: {in_reply_to_tweet_id: tweetId}
+      }).catch(() => {});
+      return res.status(500).json({error: "Murf processing failed", details: murfError.message});
+    } finally {
+      // Clean up video file
+      try {
+        fs.unlinkSync(videoPath);
+      } catch (e) {
+        logger.warn(`Could not unlink video path ${videoPath}`, e);
+      }
+    }
+    
+    // Reply with the dubbed video
+    try {
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
+        reply: {in_reply_to_tweet_id: tweetId}
+      });
+      logger.info("processTweetDirect: completed successfully", {requestId, tweetId, language: normalizedLanguage});
+    } catch (e) {
+      logger.error("processTweetDirect: final reply failed", {error: e.message});
+    }
+    
+    return res.json({
+      success: true,
+      tweetId,
+      language: normalizedLanguage,
+      dubbedVideoUrl,
+      message: "Tweet processed successfully!"
+    });
+    
+  } catch (error) {
+    logger.error("processTweetDirect: unexpected error", {requestId, error: error.message});
+    return res.status(500).json({error: error.message});
+  }
+});
+
+/**
+ * Twitter Webhook endpoint - receives mention events directly from Twitter
+ */
+export const twitterWebhook = onRequest(async (req, res) => {
+  try {
+    logger.info("twitterWebhook: received request", {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
+    });
+
+    // Handle Twitter's CRC (Challenge Response Check) for webhook verification
+    if (req.method === "GET" && req.query.crc_token) {
+      const crcToken = req.query.crc_token;
+      const responseToken = createCrcResponse(crcToken);
+      logger.info("twitterWebhook: CRC challenge", {crcToken, responseToken});
+      return res.json({response_token: responseToken});
+    }
+
+    // Handle actual webhook events (POST requests)
+    if (req.method === "POST") {
+      await processWebhookEvent(req.body);
+      return res.json({success: true});
+    }
+
+    res.status(400).json({error: "Invalid request method"});
+  } catch (error) {
+    logger.error("twitterWebhook: error", {error: error.message, stack: error.stack});
+    res.status(500).json({error: error.message});
+  }
+});
+
+/**
+ * Creates CRC response for Twitter webhook verification
+ * @param {string} crcToken - The CRC token from Twitter
+ * @returns {string} The response token
+ */
+function createCrcResponse(crcToken) {
+  const consumerSecret = getConfig("API_KEY_SECRET", "twitter", "api_key_secret");
+  
+  const hmac = crypto.createHmac("sha256", consumerSecret);
+  hmac.update(crcToken);
+  return "sha256=" + hmac.digest("base64");
+}
+
+/**
+ * Processes webhook events from Twitter
+ * @param {Object} eventData - The webhook event data from Twitter
+ */
+async function processWebhookEvent(eventData) {
+  const requestId = `webhook_${Date.now()}`;
+  
+  try {
+    logger.info("processWebhookEvent: processing", {requestId, eventData});
+
+    // Check if this is a tweet_create event with mentions
+    if (eventData.tweet_create_events) {
+      for (const tweet of eventData.tweet_create_events) {
+        await processMentionTweet(tweet, requestId);
+      }
+    }
+    
+    logger.info("processWebhookEvent: completed", {requestId});
+  } catch (error) {
+    logger.error("processWebhookEvent: error", {
+      error: error.message,
+      stack: error.stack,
+      requestId,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Processes a single mention tweet from webhook
+ * @param {Object} tweet - The tweet data from Twitter webhook
+ * @param {string} requestId - Request ID for logging
+ */
+async function processMentionTweet(tweet, requestId) {
+  try {
+    const tweetId = tweet.id_str;
+    const text = tweet.text || "";
+    const authorScreenName = tweet.user?.screen_name || "user";
+    
+    logger.info("processMentionTweet: handling", {
+      tweetId,
+      text,
+      author: authorScreenName,
+      requestId,
+    });
+
+    // Check if tweet has been processed already
+    const tweetDoc = await processedTweetsRef.doc(tweetId).get();
+    if (tweetDoc.exists) {
+      logger.info("processMentionTweet: already processed", {tweetId, requestId});
+      return;
+    }
+
+    // Parse the mention for language and video URL
+    const {language: desiredLanguageRaw, tweetUrl} = await parseMention(text);
+    
+    if (!tweetUrl) {
+      const replyText = `@${authorScreenName} Please include a tweet link with a video to dub.`;
+      await twitterClient.v2.tweet({
+        text: replyText,
+        reply: {in_reply_to_tweet_id: tweetId},
+      }).catch(() => {});
+      return;
+    }
+
+    const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
+
+    // Send initial reply
+    try {
+      const replyText = `@${authorScreenName} Dubbing in ${normalizedLanguage}…`;
+      await twitterClient.v2.tweet({
+        text: replyText,
+        reply: {in_reply_to_tweet_id: tweetId},
+      }).catch(() => {});
+    } catch (e) {
+      logger.warn(`Could not post initial reply for ${tweetId}`, e);
+    }
+
+    // Process the video
+    const videoPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
+    
+    try {
+      // Download video with detailed logging
+      logger.info("processMentionTweet: starting video download", {
+        tweetUrl,
+        tweetId,
+        requestId,
+      });
+      
+      const videoData = await getTwitterMedia(tweetUrl);
+      
+      logger.info("processMentionTweet: video metadata received", {
+        hasVideoData: !!videoData,
+        hasMedia: !!videoData?.media,
+        mediaLength: videoData?.media?.length,
+        firstMediaUrl: videoData?.media?.[0]?.url,
+        tweetId,
+        requestId,
+      });
+      
+      if (!videoData || !videoData.media || !videoData.media[0] || !videoData.media[0].url) {
+        throw new Error("No video URL found in tweet");
+      }
+      
+      // Download the video from the URL
+      const videoUrl = videoData.media[0].url;
+      logger.info("processMentionTweet: downloading video from URL", {
+        videoUrl,
+        tweetId,
+        requestId,
+      });
+      
+      const response = await axios({
+        method: "GET",
+        url: videoUrl,
+        responseType: "arraybuffer",
+      });
+      
+      logger.info("processMentionTweet: video downloaded", {
+        dataSize: response.data.length,
+        contentType: response.headers["content-type"],
+        tweetId,
+        requestId,
+      });
+      
+      fs.writeFileSync(videoPath, response.data);
+
+      // Send to Murf for dubbing
+      const dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
+
+      // Reply with dubbed video
+      const replyText = `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`;
+      await twitterClient.v2.tweet({
+        text: replyText,
+        reply: {in_reply_to_tweet_id: tweetId},
+      }).catch(() => {});
+
+      // Mark as processed
+      await processedTweetsRef.doc(tweetId).set({
+        status: "processed",
+        timestamp: new Date(),
+        language: normalizedLanguage,
+      });
+
+      logger.info("processMentionTweet: completed successfully", {
+        tweetId,
+        language: normalizedLanguage,
+        requestId,
+      });
+
+    } catch (processingError) {
+      // Handle both download and dubbing errors
+      logger.error("processMentionTweet: processing failed", {
+        error: processingError.message,
+        tweetId,
+        requestId,
+      });
+      
+      let replyText;
+      if (processingError.message.includes("download")) {
+        replyText = `@${authorScreenName} I couldn't download that video.`;
+      } else {
+        replyText = `@${authorScreenName} Dubbing failed (${normalizedLanguage}). Please try again later.`;
+      }
+      
+      await twitterClient.v2.tweet({
+        text: replyText,
+        reply: {in_reply_to_tweet_id: tweetId},
+      }).catch(() => {});
+    } finally {
+      // Clean up video file
+      try {
+        fs.unlinkSync(videoPath);
+      } catch (e) {
+        logger.warn(`Could not unlink video path ${videoPath}`, e);
       }
     }
 
-    if (newestId && newestId !== sinceId) {
-      await stateRef.set({ lastMentionId: newestId }, { merge: true });
-    }
-    logger.info("pollMentions: done", { requestId, updatedSince: sinceId, newestId });
-  } catch (e) {
-    logger.error("pollMentions: unexpected error", { error: e.message });
+  } catch (error) {
+    logger.error("processMentionTweet: unexpected error", {
+      error: error.message,
+      stack: error.stack,
+      tweetId: tweet.id_str,
+      requestId,
+    });
   }
-});
+}
