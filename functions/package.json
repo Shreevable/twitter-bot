@@ -1,6 +1,7 @@
 {
   "name": "functions",
   "description": "Cloud Functions for Firebase",
+  "type": "module",
   "scripts": {
     "lint": "eslint .",
     "serve": "firebase emulators:start --only functions",
@@ -8,26 +9,28 @@
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "type": "module"
+    "test": "mocha 'test/**/*.test.js' --timeout 10000",
+    "test:watch": "mocha 'test/**/*.test.js' --watch"
   },
   "engines": {
-    "node": "22"
+    "node": "18"
   },
   "main": "index.js",
   "dependencies": {
     "axios": "^1.11.0",
-    "dot-env": "^0.0.1",
-    "dotenv": "^17.2.0",
-    "firebase-admin": "^12.6.0",
-    "firebase-functions": "^6.0.1",
-    "node-fetch": "^3.3.2",
-    "openai": "^5.10.2",
-    "twitter-api-v2": "^1.24.0"
+    "dotenv": "^16.0.3",
+    "firebase-admin": "^12.0.0",
+    "firebase-functions": "^5.0.0",
+    "form-data": "^4.0.0",
+    "get-twitter-media": "^2.0.8",
+    "openai": "^4.20.1",
+    "twitter-api-v2": "^1.15.2"
   },
   "devDependencies": {
-    "eslint": "^8.15.0",
+    "eslint": "^8.13.0",
     "eslint-config-google": "^0.14.0",
-    "firebase-functions-test": "^3.1.0"
+    "mocha": "^10.2.0",
+    "sinon": "^15.0.1"
   },
   "private": true
 }
