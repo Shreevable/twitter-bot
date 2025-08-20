@@ -266,9 +266,25 @@ export const handleMention = onRequest(async (req, res) => {
     }
 
     try {
+      // Download the dubbed video from Murf
+      logger.info("handleMention: downloading dubbed video", {requestId, url: dubbedVideoUrl});
+      const videoResponse = await axios({
+        method: 'GET',
+        url: dubbedVideoUrl,
+        responseType: 'arraybuffer'
+      });
+      
+      // Upload video to Twitter
+      logger.info("handleMention: uploading to Twitter", {requestId});
+      const mediaId = await twitterClient.v1.uploadMedia(videoResponse.data, {
+        mimeType: 'video/mp4'
+      });
+      
+      // Reply with the dubbed video attached
       await twitterClient.v2.tweet({
-        text: `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
+        text: `@${authorScreenName} Here's your video dubbed in ${normalizedLanguage}! 🎙️`,
         reply: mention.id_str || mention.id ? {in_reply_to_tweet_id: mention.id_str || mention.id} : undefined,
+        media: {media_ids: [mediaId]}
       });
     } catch (e) {
       logger.error("handleMention: final reply failed", {error: e.message});
@@ -281,14 +297,23 @@ export const handleMention = onRequest(async (req, res) => {
   }
 });
 
-// Smart polling with rate limiting protection
-export const pollMentions = onSchedule("every 10 minutes", async (event) => {
+// Optimized polling - reduced frequency to avoid rate limits during processing
+export const pollMentions = onSchedule("every 30 minutes", async (event) => {
   await doPollMentions();
 });
 
 async function doPollMentions() {
   const requestId = `poll_${Date.now()}`;
   try {
+    // Check if already processing to avoid overlapping requests
+    if (processedTweetsRef && processedTweetsRef.parent) {
+      const processingDoc = await processedTweetsRef.parent.doc('processing').get();
+      if (processingDoc.exists && processingDoc.data().active) {
+        logger.info("pollMentions: skipping - already processing", {requestId});
+        return;
+      }
+    }
+    
     logger.info("pollMentions: starting", {requestId});
     
     // Add rate limiting protection
@@ -296,7 +321,7 @@ async function doPollMentions() {
     
     // Use hardcoded bot ID to avoid rate limiting on me() calls
     // You can get this from your Twitter Developer Portal or by running me() once
-    const botId = "1853976698639147008"; // Replace with your actual bot ID if different
+    const botId = "1957937770741264385"; // @dubbing1234 bot ID
     
     if (!botId) {
       logger.error("pollMentions: bot ID not configured");
@@ -304,22 +329,36 @@ async function doPollMentions() {
     }
     const stateSnap = await stateRef.get().catch(() => undefined);
     const sinceId = stateSnap?.exists ? stateSnap.data().lastMentionId : undefined;
-    const params = {
-      max_results: 10,
-      "expansions": "author_id",
-      "user.fields": "username",
-    };
-          if (sinceId) {
-        params.since_id = sinceId;
-      }
       
       // Add delay before timeline call
       await new Promise(resolve => setTimeout(resolve, 1000));
       
       let timeline;
       try {
+        // Use userMentionTimeline with proper parameters
+        const params = {
+          max_results: 10,
+          'tweet.fields': ['created_at', 'author_id', 'conversation_id'],
+          'user.fields': ['username'],
+          expansions: ['author_id']
+        };
+        
+        // Add since_id if we have one to get only new mentions
+        if (sinceId) {
+          params.since_id = sinceId;
+        }
+        
+        // This should get mentions TO the bot user
         timeline = await twitterClient.v2.userMentionTimeline(botId, params);
+        logger.info("pollMentions: API call successful", {requestId, dataLength: timeline?.data?.data?.length});
       } catch (timelineError) {
+        logger.error("pollMentions: API error", {
+          error: timelineError.message,
+          code: timelineError.code,
+          data: timelineError.data,
+          requestId
+        });
+        
         if (timelineError.code === 429) {
           logger.warn("Rate limited on timeline call, skipping this run", {requestId});
           return;
@@ -334,7 +373,11 @@ async function doPollMentions() {
     const authors = timeline.includes?.users || [];
     const authorMap = new Map(authors.map((a) => [a.id, a.username]));
 
-    const mentions = [...timeline.data.data].reverse();
+    // Filter out the bot's own tweets and get only mentions TO the bot
+    const mentions = timeline.data.data
+      .filter(tweet => tweet.author_id !== botId) // Exclude bot's own tweets
+      .filter(tweet => tweet.text.includes('@dubbing1234')) // Only tweets mentioning the bot
+      .reverse();
     let newestId = sinceId;
     for (const m of mentions) {
       newestId = m.id;
@@ -343,23 +386,23 @@ async function doPollMentions() {
       const author = authorMap.get(authorId) || "user";
 
       // Check if tweet has been processed
-      const tweetDoc = await processedTweetsRef.doc(m.id).get();
-      if (tweetDoc.exists) {
-        logger.info("Skipping already processed tweet", {id: m.id});
-        continue;
+      if (processedTweetsRef) {
+        const tweetDoc = await processedTweetsRef.doc(m.id).get();
+        if (tweetDoc.exists) {
+          logger.info("Skipping already processed tweet", {id: m.id});
+          continue;
+        }
       }
 
       logger.info("pollMentions: handling mention", {id: m.id, text, author});
       const {language: desiredLanguageRaw, tweetUrl} = await parseMention(text);
       if (!tweetUrl) {
-        const replyText = `@${author || "user"} Please include a tweet link with a video to dub.`;
-        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
+        // Skip - no video found, no need to reply
         continue;
       }
       const normalizedLanguage = normalizeLanguage(desiredLanguageRaw) || "English";
       try {
-        const replyText = `@${author || "user"} Dubbing in ${normalizedLanguage}…`;
-        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
+        // Process silently - no progress tweets
       } catch (e) {
         logger.warn(`Could not post initial reply for ${m.id}`, e);
       }
@@ -371,19 +414,40 @@ async function doPollMentions() {
         fs.writeFileSync(videoPath, videoData.media[0].buffer);
       } catch (dlError) {
         logger.error("pollMentions: download failed", {error: dlError.message});
-        const replyText = `@${author || "user"} I couldn't download that video.`;
-        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
+        // Skip silently - no error tweets
         continue;
       }
       try {
         const dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
-        const replyText = `@${author || "user"} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`;
-        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
-        await processedTweetsRef.doc(m.id).set({status: "processed", timestamp: new Date()});
+        
+        // Download the dubbed video from Murf
+        logger.info("Downloading dubbed video from Murf", {url: dubbedVideoUrl});
+        const videoResponse = await axios({
+          method: 'GET',
+          url: dubbedVideoUrl,
+          responseType: 'arraybuffer'
+        });
+        
+        // Upload video to Twitter
+        logger.info("Uploading dubbed video to Twitter");
+        const mediaId = await twitterClient.v1.uploadMedia(videoResponse.data, {
+          mimeType: 'video/mp4'
+        });
+        
+        // Reply with the dubbed video attached
+        const replyText = `@${author || "user"} Here's your video dubbed in ${normalizedLanguage}! 🎙️`;
+        await twitterClient.v2.tweet({
+          text: replyText, 
+          reply: {in_reply_to_tweet_id: m.id},
+          media: {media_ids: [mediaId]}
+        }).catch(() => {});
+        
+        if (processedTweetsRef) {
+          await processedTweetsRef.doc(m.id).set({status: "processed", timestamp: new Date()});
+        }
       } catch (murfError) {
         logger.error("pollMentions: murf failed", {error: murfError.message});
-        const replyText = `@${author || "user"} Dubbing failed (${normalizedLanguage}). Please try again later.`;
-        await twitterClient.v2.tweet({text: replyText, reply: {in_reply_to_tweet_id: m.id}}).catch(() => {});
+        // Skip silently - no error tweets  
       } finally {
         try {
           fs.unlinkSync(videoPath);
@@ -414,6 +478,21 @@ export const pollMentionsHttp = onRequest(async (req, res) => {
   }
 });
 
+// Debug function to get bot account info
+export const getBotInfo = onRequest(async (req, res) => {
+  try {
+    const me = await twitterClient.v2.me();
+    return res.json({
+      id: me.data.id,
+      username: me.data.username,
+      name: me.data.name,
+      message: `Your bot handle is: @${me.data.username}`
+    });
+  } catch (e) {
+    return res.status(500).json({error: e.message});
+  }
+});
+
 // Direct tweet processing endpoint - no polling needed!
 export const processTweetDirect = onRequest(async (req, res) => {
   const requestId = `direct_${Date.now()}`;
@@ -427,10 +506,11 @@ export const processTweetDirect = onRequest(async (req, res) => {
     
     logger.info("processTweetDirect: starting", {requestId, tweetId});
     
-    // Get the tweet directly using Twitter API
+    // Get the tweet directly using Twitter API (with media info for efficiency)
     const tweet = await twitterClient.v2.singleTweet(tweetId, {
-      expansions: ['author_id'],
-      'user.fields': ['username']
+      expansions: ['author_id', 'attachments.media_keys'],
+      'user.fields': ['username'],
+      'media.fields': ['url', 'variants', 'type']
     });
     
     if (!tweet.data) {
@@ -444,8 +524,8 @@ export const processTweetDirect = onRequest(async (req, res) => {
     logger.info("processTweetDirect: found tweet", {requestId, tweetId, text: tweetText, author: authorScreenName});
     
     // Check if it mentions our bot
-    if (!tweetText.includes('@SinghVikra26892')) {
-      return res.status(400).json({error: "Tweet doesn't mention @SinghVikra26892"});
+    if (!tweetText.includes('@dubbing1234')) {
+      return res.status(400).json({error: "Tweet doesn't mention @dubbing1234"});
     }
     
     // Parse the mention for language and video URL
@@ -470,14 +550,9 @@ export const processTweetDirect = onRequest(async (req, res) => {
     try {
       let videoUrl = null;
       
-      // First, check if this tweet itself has media attachments
-      const tweetWithMedia = await twitterClient.v2.singleTweet(tweetId, {
-        expansions: ['attachments.media_keys'],
-        'media.fields': ['url', 'variants', 'type']
-      });
-      
-      if (tweetWithMedia.includes?.media?.length > 0) {
-        const videoMedia = tweetWithMedia.includes.media.find(m => m.type === 'video');
+      // Check if this tweet has media attachments (already fetched above)
+      if (tweet.includes?.media?.length > 0) {
+        const videoMedia = tweet.includes.media.find(m => m.type === 'video');
         if (videoMedia && videoMedia.variants) {
           // Get the highest quality MP4 variant
           const mp4Variant = videoMedia.variants
@@ -513,10 +588,6 @@ export const processTweetDirect = onRequest(async (req, res) => {
       logger.info("processTweetDirect: video downloaded", {requestId, videoPath, size: videoBuffer.length});
     } catch (dlError) {
       logger.error("processTweetDirect: download failed", {requestId, error: dlError.message});
-      await twitterClient.v2.tweet({
-        text: `@${authorScreenName} I couldn't find or download a video from your tweet. Please make sure your tweet contains or links to a video.`,
-        reply: {in_reply_to_tweet_id: tweetId}
-      }).catch(() => {});
       return res.status(500).json({error: "Failed to download video", details: dlError.message});
     }
     
@@ -527,10 +598,6 @@ export const processTweetDirect = onRequest(async (req, res) => {
       logger.info("processTweetDirect: dubbing completed", {requestId, dubbedVideoUrl});
     } catch (murfError) {
       logger.error("processTweetDirect: murf failed", {requestId, error: murfError.message});
-      await twitterClient.v2.tweet({
-        text: `@${authorScreenName} Dubbing failed (${normalizedLanguage}). Please try again later.`,
-        reply: {in_reply_to_tweet_id: tweetId}
-      }).catch(() => {});
       return res.status(500).json({error: "Murf processing failed", details: murfError.message});
     } finally {
       // Clean up video file
@@ -541,12 +608,29 @@ export const processTweetDirect = onRequest(async (req, res) => {
       }
     }
     
-    // Reply with the dubbed video
+    // Download the dubbed video and reply with it attached
     try {
-      await twitterClient.v2.tweet({
-        text: `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`,
-        reply: {in_reply_to_tweet_id: tweetId}
+      // Download the dubbed video from Murf
+      logger.info("processTweetDirect: downloading dubbed video", {requestId, url: dubbedVideoUrl});
+      const videoResponse = await axios({
+        method: 'GET',
+        url: dubbedVideoUrl,
+        responseType: 'arraybuffer'
       });
+      
+      // Upload video to Twitter
+      logger.info("processTweetDirect: uploading to Twitter", {requestId});
+      const mediaId = await twitterClient.v1.uploadMedia(videoResponse.data, {
+        mimeType: 'video/mp4'
+      });
+      
+      // Reply with the dubbed video attached
+      await twitterClient.v2.tweet({
+        text: `@${authorScreenName} Here's your video dubbed in ${normalizedLanguage}! 🎙️`,
+        reply: {in_reply_to_tweet_id: tweetId},
+        media: {media_ids: [mediaId]}
+      });
+      
       logger.info("processTweetDirect: completed successfully", {requestId, tweetId, language: normalizedLanguage});
     } catch (e) {
       logger.error("processTweetDirect: final reply failed", {error: e.message});
@@ -658,10 +742,12 @@ async function processMentionTweet(tweet, requestId) {
     });
 
     // Check if tweet has been processed already
-    const tweetDoc = await processedTweetsRef.doc(tweetId).get();
-    if (tweetDoc.exists) {
-      logger.info("processMentionTweet: already processed", {tweetId, requestId});
-      return;
+    if (processedTweetsRef) {
+      const tweetDoc = await processedTweetsRef.doc(tweetId).get();
+      if (tweetDoc.exists) {
+        logger.info("processMentionTweet: already processed", {tweetId, requestId});
+        return;
+      }
     }
 
     // Parse the mention for language and video URL
@@ -741,19 +827,36 @@ async function processMentionTweet(tweet, requestId) {
       // Send to Murf for dubbing
       const dubbedVideoUrl = await sendToMurf(videoPath, normalizedLanguage);
 
-      // Reply with dubbed video
-      const replyText = `@${authorScreenName} Here is your dubbed video in ${normalizedLanguage}: ${dubbedVideoUrl}`;
+      // Download the dubbed video and reply with it attached
+      logger.info("processMentionTweet: downloading dubbed video", {requestId, url: dubbedVideoUrl});
+      const videoResponse = await axios({
+        method: 'GET',
+        url: dubbedVideoUrl,
+        responseType: 'arraybuffer'
+      });
+      
+      // Upload video to Twitter
+      logger.info("processMentionTweet: uploading to Twitter", {requestId});
+      const mediaId = await twitterClient.v1.uploadMedia(videoResponse.data, {
+        mimeType: 'video/mp4'
+      });
+      
+      // Reply with the dubbed video attached
+      const replyText = `@${authorScreenName} Here's your video dubbed in ${normalizedLanguage}! 🎙️`;
       await twitterClient.v2.tweet({
         text: replyText,
         reply: {in_reply_to_tweet_id: tweetId},
+        media: {media_ids: [mediaId]}
       }).catch(() => {});
 
       // Mark as processed
-      await processedTweetsRef.doc(tweetId).set({
-        status: "processed",
-        timestamp: new Date(),
-        language: normalizedLanguage,
-      });
+      if (processedTweetsRef) {
+        await processedTweetsRef.doc(tweetId).set({
+          status: "processed",
+          timestamp: new Date(),
+          language: normalizedLanguage,
+        });
+      }
 
       logger.info("processMentionTweet: completed successfully", {
         tweetId,
